@@ -2,8 +2,7 @@ package driver
 
 import (
 	"context"
-	"time"
-
+	"github.com/ethereum-optimism/optimism/op-node/rollup/sequencing"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
 
@@ -44,7 +43,7 @@ type Metrics interface {
 
 	EngineMetrics
 	L1FetcherMetrics
-	SequencerMetrics
+	sequencing.SequencerMetrics
 }
 
 type L1Chain interface {
@@ -114,15 +113,6 @@ type L1StateIface interface {
 	L1Finalized() eth.L1BlockRef
 }
 
-type SequencerIface interface {
-	StartBuildingBlock(ctx context.Context) error
-	CompleteBuildingBlock(ctx context.Context, agossip async.AsyncGossiper, sequencerConductor conductor.SequencerConductor) (*eth.ExecutionPayloadEnvelope, error)
-	PlanNextSequencerAction() time.Duration
-	RunNextSequencerAction(ctx context.Context, agossip async.AsyncGossiper, sequencerConductor conductor.SequencerConductor) (*eth.ExecutionPayloadEnvelope, error)
-	BuildingOnto() eth.L2BlockRef
-	CancelBuildingBlock(ctx context.Context)
-}
-
 type Network interface {
 	// PublishL2Payload is called by the driver whenever there is a new payload to publish, synchronously with the driver main loop.
 	PublishL2Payload(ctx context.Context, payload *eth.ExecutionPayloadEnvelope) error
@@ -147,11 +137,6 @@ type AltSync interface {
 	RequestL2Range(ctx context.Context, start, end eth.L2BlockRef) error
 }
 
-type SequencerStateListener interface {
-	SequencerStarted() error
-	SequencerStopped() error
-}
-
 // NewDriver composes an events handler that tracks L1 state, triggers L2 Derivation, and optionally sequences new L2 blocks.
 func NewDriver(
 	driverCfg *Config,
@@ -164,7 +149,7 @@ func NewDriver(
 	log log.Logger,
 	snapshotLog log.Logger,
 	metrics Metrics,
-	sequencerStateListener SequencerStateListener,
+	sequencerStateListener sequencing.SequencerStateListener,
 	safeHeadListener rollup.SafeHeadListener,
 	syncCfg *sync.Config,
 	sequencerConductor conductor.SequencerConductor,
@@ -176,8 +161,7 @@ func NewDriver(
 
 	l1 = NewMeteredL1Fetcher(l1, metrics)
 	l1State := NewL1State(log, metrics)
-	sequencerConfDepth := NewConfDepth(driverCfg.SequencerConfDepth, l1State.L1Head, l1)
-	findL1Origin := NewL1OriginSelector(log, cfg, sequencerConfDepth)
+
 	verifConfDepth := NewConfDepth(driverCfg.VerifierConfDepth, l1State.L1Head, l1)
 	ec := engine.NewEngineController(l2, log, metrics, cfg, syncCfg.SyncMode, synchronousEvents)
 	engineResetDeriver := engine.NewEngineResetDeriver(driverCtx, log, cfg, l1, l2, syncCfg, synchronousEvents)
@@ -193,10 +177,21 @@ func NewDriver(
 	attributesHandler := attributes.NewAttributesHandler(log, cfg, driverCtx, l2, synchronousEvents)
 	derivationPipeline := derive.NewDerivationPipeline(log, cfg, verifConfDepth, l1Blobs, plasma, l2, metrics)
 	pipelineDeriver := derive.NewPipelineDeriver(driverCtx, derivationPipeline, synchronousEvents)
-	attrBuilder := derive.NewFetchingAttributesBuilder(cfg, l1, l2)
-	meteredEngine := NewMeteredEngine(cfg, ec, metrics, log) // Only use the metered engine in the sequencer b/c it records sequencing metrics.
-	sequencer := NewSequencer(log, cfg, meteredEngine, attrBuilder, findL1Origin, metrics)
-	asyncGossiper := async.NewAsyncGossiper(driverCtx, network, log, metrics)
+
+	// TODO port metered-engine metrics to engine controller
+	//meteredEngine := NewMeteredEngine(cfg, ec, metrics, log) // Only use the metered engine in the sequencer b/c it records sequencing metrics.
+
+	var sequencer sequencing.SequencerIface
+	if driverCfg.SequencerEnabled {
+		asyncGossiper := async.NewAsyncGossiper(driverCtx, network, log, metrics)
+		attrBuilder := derive.NewFetchingAttributesBuilder(cfg, l1, l2)
+		sequencerConfDepth := NewConfDepth(driverCfg.SequencerConfDepth, l1State.L1Head, l1)
+		findL1Origin := sequencing.NewL1OriginSelector(log, cfg, sequencerConfDepth)
+		sequencer = sequencing.NewSequencer(driverCtx, log, cfg, attrBuilder, findL1Origin,
+			sequencerStateListener, sequencerConductor, asyncGossiper, metrics)
+	} else {
+		sequencer = sequencing.DisabledSequencer{}
+	}
 
 	syncDeriver := &SyncDeriver{
 		Derivation:     derivationPipeline,
@@ -217,34 +212,29 @@ func NewDriver(
 	schedDeriv := NewStepSchedulingDeriver(log, synchronousEvents)
 
 	driver := &Driver{
-		l1State:            l1State,
-		SyncDeriver:        syncDeriver,
-		sched:              schedDeriv,
-		synchronousEvents:  synchronousEvents,
-		stateReq:           make(chan chan struct{}),
-		forceReset:         make(chan chan struct{}, 10),
-		startSequencer:     make(chan hashAndErrorChannel, 10),
-		stopSequencer:      make(chan chan hashAndError, 10),
-		sequencerActive:    make(chan chan bool, 10),
-		sequencerNotifs:    sequencerStateListener,
-		driverConfig:       driverCfg,
-		driverCtx:          driverCtx,
-		driverCancel:       driverCancel,
-		log:                log,
-		snapshotLog:        snapshotLog,
-		sequencer:          sequencer,
-		network:            network,
-		metrics:            metrics,
-		l1HeadSig:          make(chan eth.L1BlockRef, 10),
-		l1SafeSig:          make(chan eth.L1BlockRef, 10),
-		l1FinalizedSig:     make(chan eth.L1BlockRef, 10),
-		unsafeL2Payloads:   make(chan *eth.ExecutionPayloadEnvelope, 10),
-		altSync:            altSync,
-		asyncGossiper:      asyncGossiper,
-		sequencerConductor: sequencerConductor,
+		l1State:           l1State,
+		SyncDeriver:       syncDeriver,
+		sched:             schedDeriv,
+		synchronousEvents: synchronousEvents,
+		stateReq:          make(chan chan struct{}),
+		forceReset:        make(chan chan struct{}, 10),
+		driverConfig:      driverCfg,
+		driverCtx:         driverCtx,
+		driverCancel:      driverCancel,
+		log:               log,
+		snapshotLog:       snapshotLog,
+		sequencer:         sequencer,
+		network:           network,
+		metrics:           metrics,
+		l1HeadSig:         make(chan eth.L1BlockRef, 10),
+		l1SafeSig:         make(chan eth.L1BlockRef, 10),
+		l1FinalizedSig:    make(chan eth.L1BlockRef, 10),
+		unsafeL2Payloads:  make(chan *eth.ExecutionPayloadEnvelope, 10),
+		altSync:           altSync,
 	}
 
 	*rootDeriver = []rollup.Deriver{
+		sequencer,
 		syncDeriver,
 		engineResetDeriver,
 		engDeriv,

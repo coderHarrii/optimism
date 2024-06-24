@@ -1,7 +1,6 @@
 package driver
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,26 +12,17 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 
 	"github.com/ethereum-optimism/optimism/op-node/rollup"
-	"github.com/ethereum-optimism/optimism/op-node/rollup/async"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/clsync"
-	"github.com/ethereum-optimism/optimism/op-node/rollup/conductor"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/engine"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/finality"
+	"github.com/ethereum-optimism/optimism/op-node/rollup/sequencing"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/sync"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 )
 
-var (
-	ErrSequencerAlreadyStarted = errors.New("sequencer already running")
-	ErrSequencerAlreadyStopped = errors.New("sequencer not running")
-)
-
 // Deprecated: use eth.SyncStatus instead.
 type SyncStatus = eth.SyncStatus
-
-// sealingDuration defines the expected time it takes to seal the block
-const sealingDuration = time.Millisecond * 50
 
 type Driver struct {
 	l1State L1StateIface
@@ -50,25 +40,8 @@ type Driver struct {
 	// It tells the caller that the reset occurred by closing the passed in channel.
 	forceReset chan chan struct{}
 
-	// Upon receiving a hash in this channel, the sequencer is started at the given hash.
-	// It tells the caller that the sequencer started by closing the passed in channel (or returning an error).
-	startSequencer chan hashAndErrorChannel
-
-	// Upon receiving a channel in this channel, the sequencer is stopped.
-	// It tells the caller that the sequencer stopped by returning the latest sequenced L2 block hash.
-	stopSequencer chan chan hashAndError
-
-	// Upon receiving a channel in this channel, the current sequencer status is queried.
-	// It tells the caller the status by outputting a boolean to the provided channel:
-	// true when the sequencer is active, false when it is not.
-	sequencerActive chan chan bool
-
-	// sequencerNotifs is notified when the sequencer is started or stopped
-	sequencerNotifs SequencerStateListener
-
-	sequencerConductor conductor.SequencerConductor
-
-	// Driver config: verifier and sequencer settings
+	// Driver config: verifier and sequencer settings.
+	// May not be modified after starting the Driver.
 	driverConfig *Config
 
 	// L1 Signals:
@@ -84,15 +57,11 @@ type Driver struct {
 	// Interface to signal the L2 block range to sync.
 	altSync AltSync
 
-	// async gossiper for payloads to be gossiped without
-	// blocking the event loop or waiting for insertion
-	asyncGossiper async.AsyncGossiper
-
 	// L2 Signals:
 
 	unsafeL2Payloads chan *eth.ExecutionPayloadEnvelope
 
-	sequencer SequencerIface
+	sequencer sequencing.SequencerIface
 	network   Network // may be nil, network for is optional
 
 	metrics     Metrics
@@ -108,22 +77,16 @@ type Driver struct {
 // Start starts up the state loop.
 // The loop will have been started iff err is not nil.
 func (s *Driver) Start() error {
-	log.Info("Starting driver", "sequencerEnabled", s.driverConfig.SequencerEnabled, "sequencerStopped", s.driverConfig.SequencerStopped)
+	log.Info("Starting driver", "sequencerEnabled", s.driverConfig.SequencerEnabled,
+		"sequencerStopped", s.driverConfig.SequencerStopped)
 	if s.driverConfig.SequencerEnabled {
-		// Notify the initial sequencer state
-		// This ensures persistence can write the state correctly and that the state file exists
-		var err error
-		if s.driverConfig.SequencerStopped {
-			err = s.sequencerNotifs.SequencerStopped()
-		} else {
-			err = s.sequencerNotifs.SequencerStarted()
+		if err := s.sequencer.SetMaxSafeLag(s.driverCtx, s.driverConfig.SequencerMaxSafeLag); err != nil {
+			return fmt.Errorf("failed to set sequencer max safe lag: %w", err)
 		}
-		if err != nil {
+		if err := s.sequencer.Init(s.driverCtx, !s.driverConfig.SequencerStopped); err != nil {
 			return fmt.Errorf("persist initial sequencer state: %w", err)
 		}
 	}
-
-	s.asyncGossiper.Start()
 
 	s.wg.Add(1)
 	go s.eventLoop()
@@ -134,8 +97,7 @@ func (s *Driver) Start() error {
 func (s *Driver) Close() error {
 	s.driverCancel()
 	s.wg.Wait()
-	s.asyncGossiper.Stop()
-	s.sequencerConductor.Close()
+	s.sequencer.Close()
 	return nil
 }
 
@@ -199,13 +161,26 @@ func (s *Driver) eventLoop() {
 
 	sequencerTimer := time.NewTimer(0)
 	var sequencerCh <-chan time.Time
+	var prevTime time.Time
+	// planSequencerAction updates the sequencerTimer with the next action, if any.
+	// The sequencerCh is nil (indefinitely blocks on read) if no action needs to be performed,
+	// or set to the timer channel if there is an action scheduled.
 	planSequencerAction := func() {
-		delay := s.sequencer.PlanNextSequencerAction()
-		sequencerCh = sequencerTimer.C
-		if len(sequencerCh) > 0 { // empty if not already drained before resetting
-			<-sequencerCh
+		nextAction, ok := s.sequencer.NextAction()
+		if ok {
+			sequencerCh = nil
+		} else {
+			// avoid unnecessary timer resets
+			if nextAction == prevTime {
+				return
+			}
+			prevTime = nextAction
+			sequencerCh = sequencerTimer.C
+			if len(sequencerCh) > 0 { // empty if not already drained before resetting
+				<-sequencerCh
+			}
+			sequencerTimer.Reset(time.Until(nextAction))
 		}
-		sequencerTimer.Reset(delay)
 	}
 
 	// Create a ticker to check if there is a gap in the engine queue. Whenever
@@ -229,32 +204,7 @@ func (s *Driver) eventLoop() {
 			s.log.Error("unexpected error from event-draining", "err", err)
 		}
 
-		// If we are sequencing, and the L1 state is ready, update the trigger for the next sequencer action.
-		// This may adjust at any time based on fork-choice changes or previous errors.
-		// And avoid sequencing if the derivation pipeline indicates the engine is not ready.
-		if s.driverConfig.SequencerEnabled && !s.driverConfig.SequencerStopped &&
-			s.l1State.L1Head() != (eth.L1BlockRef{}) && s.Derivation.DerivationReady() {
-			if s.driverConfig.SequencerMaxSafeLag > 0 && s.Engine.SafeL2Head().Number+s.driverConfig.SequencerMaxSafeLag <= s.Engine.UnsafeL2Head().Number {
-				// If the safe head has fallen behind by a significant number of blocks, delay creating new blocks
-				// until the safe lag is below SequencerMaxSafeLag.
-				if sequencerCh != nil {
-					s.log.Warn(
-						"Delay creating new block since safe lag exceeds limit",
-						"safe_l2", s.Engine.SafeL2Head(),
-						"unsafe_l2", s.Engine.UnsafeL2Head(),
-					)
-					sequencerCh = nil
-				}
-			} else if s.sequencer.BuildingOnto().ID() != s.Engine.UnsafeL2Head().ID() {
-				// If we are sequencing, and the L1 state is ready, update the trigger for the next sequencer action.
-				// This may adjust at any time based on fork-choice changes or previous errors.
-				//
-				// update sequencer time if the head changed
-				planSequencerAction()
-			}
-		} else {
-			sequencerCh = nil
-		}
+		planSequencerAction()
 
 		// If the engine is not ready, or if the L2 head is actively changing, then reset the alt-sync:
 		// there is no need to request L2 blocks when we are syncing already.
@@ -265,16 +215,7 @@ func (s *Driver) eventLoop() {
 
 		select {
 		case <-sequencerCh:
-			// the payload publishing is handled by the async gossiper, which will begin gossiping as soon as available
-			// so, we don't need to receive the payload here
-			_, err := s.sequencer.RunNextSequencerAction(s.driverCtx, s.asyncGossiper, s.sequencerConductor)
-			if errors.Is(err, derive.ErrReset) {
-				s.Emitter.Emit(rollup.ResetEvent{})
-			} else if err != nil {
-				s.log.Error("Sequencer critical error", "err", err)
-				return
-			}
-			planSequencerAction() // schedule the next sequencer action to keep the sequencing looping
+			s.Emitter.Emit(sequencing.SequencerActionEvent{})
 		case <-altSyncTicker.C:
 			// Check if there is a gap in the current unsafe payload queue.
 			ctx, cancel := context.WithTimeout(s.driverCtx, time.Second*2)
@@ -326,39 +267,6 @@ func (s *Driver) eventLoop() {
 			s.Derivation.Reset()
 			s.metrics.RecordPipelineReset()
 			close(respCh)
-		case resp := <-s.startSequencer:
-			unsafeHead := s.Engine.UnsafeL2Head().Hash
-			if !s.driverConfig.SequencerStopped {
-				resp.err <- ErrSequencerAlreadyStarted
-			} else if !bytes.Equal(unsafeHead[:], resp.hash[:]) {
-				resp.err <- fmt.Errorf("block hash does not match: head %s, received %s", unsafeHead.String(), resp.hash.String())
-			} else {
-				if err := s.sequencerNotifs.SequencerStarted(); err != nil {
-					resp.err <- fmt.Errorf("sequencer start notification: %w", err)
-					continue
-				}
-				s.log.Info("Sequencer has been started")
-				s.driverConfig.SequencerStopped = false
-				close(resp.err)
-				planSequencerAction() // resume sequencing
-			}
-		case respCh := <-s.stopSequencer:
-			if s.driverConfig.SequencerStopped {
-				respCh <- hashAndError{err: ErrSequencerAlreadyStopped}
-			} else {
-				if err := s.sequencerNotifs.SequencerStopped(); err != nil {
-					respCh <- hashAndError{err: fmt.Errorf("sequencer start notification: %w", err)}
-					continue
-				}
-				s.log.Warn("Sequencer has been stopped")
-				s.driverConfig.SequencerStopped = true
-				// Cancel any inflight block building. If we don't cancel this, we can resume sequencing an old block
-				// even if we've received new unsafe heads in the interim, causing us to introduce a re-org.
-				s.sequencer.CancelBuildingBlock(s.driverCtx)
-				respCh <- hashAndError{hash: s.Engine.UnsafeL2Head().Hash}
-			}
-		case respCh := <-s.sequencerActive:
-			respCh <- !s.driverConfig.SequencerStopped
 		case <-s.driverCtx.Done():
 			return
 		}
@@ -575,65 +483,15 @@ func (s *Driver) ResetDerivationPipeline(ctx context.Context) error {
 }
 
 func (s *Driver) StartSequencer(ctx context.Context, blockHash common.Hash) error {
-	if !s.driverConfig.SequencerEnabled {
-		return errors.New("sequencer is not enabled")
-	}
-	if isLeader, err := s.sequencerConductor.Leader(ctx); err != nil {
-		return fmt.Errorf("sequencer leader check failed: %w", err)
-	} else if !isLeader {
-		return errors.New("sequencer is not the leader, aborting.")
-	}
-	h := hashAndErrorChannel{
-		hash: blockHash,
-		err:  make(chan error, 1),
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case s.startSequencer <- h:
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case e := <-h.err:
-			return e
-		}
-	}
+	return s.sequencer.Start(ctx, blockHash)
 }
 
 func (s *Driver) StopSequencer(ctx context.Context) (common.Hash, error) {
-	if !s.driverConfig.SequencerEnabled {
-		return common.Hash{}, errors.New("sequencer is not enabled")
-	}
-	respCh := make(chan hashAndError, 1)
-	select {
-	case <-ctx.Done():
-		return common.Hash{}, ctx.Err()
-	case s.stopSequencer <- respCh:
-		select {
-		case <-ctx.Done():
-			return common.Hash{}, ctx.Err()
-		case he := <-respCh:
-			return he.hash, he.err
-		}
-	}
+	return s.sequencer.Stop(ctx)
 }
 
 func (s *Driver) SequencerActive(ctx context.Context) (bool, error) {
-	if !s.driverConfig.SequencerEnabled {
-		return false, nil
-	}
-	respCh := make(chan bool, 1)
-	select {
-	case <-ctx.Done():
-		return false, ctx.Err()
-	case s.sequencerActive <- respCh:
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case active := <-respCh:
-			return active, nil
-		}
-	}
+	return s.sequencer.Active(), nil
 }
 
 // syncStatus returns the current sync status, and should only be called synchronously with
@@ -699,16 +557,6 @@ func (s *Driver) snapshot(event string) {
 		"l2Head", deferJSONString{s.Engine.UnsafeL2Head()},
 		"l2Safe", deferJSONString{s.Engine.SafeL2Head()},
 		"l2FinalizedHead", deferJSONString{s.Engine.Finalized()})
-}
-
-type hashAndError struct {
-	hash common.Hash
-	err  error
-}
-
-type hashAndErrorChannel struct {
-	hash common.Hash
-	err  chan error
 }
 
 // checkForGapInUnsafeQueue checks if there is a gap in the unsafe queue and attempts to retrieve the missing payloads from an alt-sync method.

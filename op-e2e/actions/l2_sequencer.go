@@ -3,6 +3,7 @@ package actions
 import (
 	"context"
 	"errors"
+	"github.com/ethereum-optimism/optimism/op-node/rollup/sequencing"
 
 	"github.com/ethereum-optimism/optimism/op-node/node/safedb"
 	"github.com/ethereum/go-ethereum/log"
@@ -20,7 +21,7 @@ import (
 
 // MockL1OriginSelector is a shim to override the origin as sequencer, so we can force it to stay on an older origin.
 type MockL1OriginSelector struct {
-	actual         *driver.L1OriginSelector
+	actual         *sequencing.L1OriginSelector
 	originOverride eth.L1BlockRef // override which origin gets picked
 }
 
@@ -36,7 +37,7 @@ func (m *MockL1OriginSelector) FindL1Origin(ctx context.Context, l2Head eth.L2Bl
 type L2Sequencer struct {
 	*L2Verifier
 
-	sequencer *driver.Sequencer
+	sequencer *sequencing.Sequencer
 
 	failL2GossipUnsafeBlock error // mock error
 
@@ -49,11 +50,11 @@ func NewL2Sequencer(t Testing, log log.Logger, l1 derive.L1Fetcher, blobSrc deri
 	attrBuilder := derive.NewFetchingAttributesBuilder(cfg, l1, eng)
 	seqConfDepthL1 := driver.NewConfDepth(seqConfDepth, ver.l1State.L1Head, l1)
 	l1OriginSelector := &MockL1OriginSelector{
-		actual: driver.NewL1OriginSelector(log, cfg, seqConfDepthL1),
+		actual: sequencing.NewL1OriginSelector(log, cfg, seqConfDepthL1),
 	}
 	return &L2Sequencer{
 		L2Verifier:              ver,
-		sequencer:               driver.NewSequencer(log, cfg, ver.engine, attrBuilder, l1OriginSelector, metrics.NoopMetrics),
+		sequencer:               sequencing.NewSequencer(log, cfg, ver.engine, attrBuilder, l1OriginSelector, metrics.NoopMetrics),
 		mockL1OriginSelector:    l1OriginSelector,
 		failL2GossipUnsafeBlock: nil,
 	}

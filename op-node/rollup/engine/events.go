@@ -81,6 +81,7 @@ func (ev SafeDerivedEvent) String() string {
 	return "safe-derived"
 }
 
+// ProcessAttributesEvent signals to immediately process the attributes.
 type ProcessAttributesEvent struct {
 	Attributes *derive.AttributesWithParent
 }
@@ -88,6 +89,8 @@ type ProcessAttributesEvent struct {
 func (ev ProcessAttributesEvent) String() string {
 	return "process-attributes"
 }
+
+// ConfirmPayload TODO
 
 type PendingSafeRequestEvent struct {
 }
@@ -141,6 +144,33 @@ type PromoteFinalizedEvent struct {
 
 func (ev PromoteFinalizedEvent) String() string {
 	return "promote-finalized"
+}
+
+type CancelBuildingEvent struct {
+	ID eth.PayloadInfo
+}
+
+func (ev CancelBuildingEvent) String() string {
+	return "cancel-building"
+}
+
+type GetPayloadEvent struct {
+	Info eth.PayloadInfo
+}
+
+func (ev GetPayloadEvent) String() string {
+	return "get-payload"
+}
+
+// GotPayloadEvent is emitted by the engine when a payload finished building,
+// but is not locally inserted as canonical block yet
+type GotPayloadEvent struct {
+	Info     eth.PayloadInfo
+	Envelope *eth.ExecutionPayloadEnvelope
+}
+
+func (ev GotPayloadEvent) String() string {
+	return "got-payload"
 }
 
 type EngDeriver struct {
@@ -265,6 +295,13 @@ func (d *EngDeriver) OnEvent(ev rollup.Event) {
 			return
 		}
 		d.ec.SetFinalizedHead(x.Ref)
+	case GetPayloadEvent:
+		envelope, err := d.ec.engine.GetPayload(d.ctx, x.Info)
+		// TODO handle err
+		d.emitter.Emit(GotPayloadEvent{
+			Info:     x.Info,
+			Envelope: envelope,
+		})
 	}
 }
 
