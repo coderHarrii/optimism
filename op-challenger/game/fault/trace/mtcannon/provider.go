@@ -1,4 +1,4 @@
-package asterisc
+package mtcannon
 
 import (
 	"context"
@@ -10,16 +10,18 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/ethereum-optimism/optimism/cannon/mipsevm"
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/utils"
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/vm"
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/types"
 	"github.com/ethereum-optimism/optimism/op-program/host/kvstore"
 	"github.com/ethereum-optimism/optimism/op-service/ioutil"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/log"
 )
 
-type AsteriscTraceProvider struct {
+type MTCannonTraceProvider struct {
 	logger         log.Logger
 	dir            string
 	prestate       string
@@ -34,19 +36,19 @@ type AsteriscTraceProvider struct {
 	lastStep uint64
 }
 
-func NewTraceProvider(logger log.Logger, m vm.Metricer, cfg vm.Config, prestateProvider types.PrestateProvider, asteriscPrestate string, localInputs utils.LocalGameInputs, dir string, gameDepth types.Depth) *AsteriscTraceProvider {
-	return &AsteriscTraceProvider{
+func NewTraceProvider(logger log.Logger, m vm.Metricer, cfg vm.Config, prestateProvider types.PrestateProvider, prestate string, localInputs utils.LocalGameInputs, dir string, gameDepth types.Depth) *MTCannonTraceProvider {
+	return &MTCannonTraceProvider{
 		logger:           logger,
 		dir:              dir,
-		prestate:         asteriscPrestate,
-		generator:        vm.NewExecutor(logger, m, cfg, asteriscPrestate, localInputs),
+		prestate:         prestate,
+		generator:        vm.NewExecutor(logger, m, cfg, prestate, localInputs),
 		gameDepth:        gameDepth,
 		preimageLoader:   utils.NewPreimageLoader(kvstore.NewDiskKV(vm.PreimageDir(dir)).Get),
 		PrestateProvider: prestateProvider,
 	}
 }
 
-func (p *AsteriscTraceProvider) Get(ctx context.Context, pos types.Position) (common.Hash, error) {
+func (p *MTCannonTraceProvider) Get(ctx context.Context, pos types.Position) (common.Hash, error) {
 	traceIndex := pos.TraceIndex(p.gameDepth)
 	if !traceIndex.IsUint64() {
 		return common.Hash{}, errors.New("trace index out of bounds")
@@ -63,7 +65,7 @@ func (p *AsteriscTraceProvider) Get(ctx context.Context, pos types.Position) (co
 	return value, nil
 }
 
-func (p *AsteriscTraceProvider) GetStepData(ctx context.Context, pos types.Position) ([]byte, []byte, *types.PreimageOracleData, error) {
+func (p *MTCannonTraceProvider) GetStepData(ctx context.Context, pos types.Position) ([]byte, []byte, *types.PreimageOracleData, error) {
 	traceIndex := pos.TraceIndex(p.gameDepth)
 	if !traceIndex.IsUint64() {
 		return nil, nil, nil, errors.New("trace index out of bounds")
@@ -87,13 +89,13 @@ func (p *AsteriscTraceProvider) GetStepData(ctx context.Context, pos types.Posit
 	return value, data, oracleData, nil
 }
 
-func (p *AsteriscTraceProvider) GetL2BlockNumberChallenge(_ context.Context) (*types.InvalidL2BlockNumberChallenge, error) {
+func (p *MTCannonTraceProvider) GetL2BlockNumberChallenge(_ context.Context) (*types.InvalidL2BlockNumberChallenge, error) {
 	return nil, types.ErrL2BlockNumberValid
 }
 
 // loadProof will attempt to load or generate the proof data at the specified index
 // If the requested index is beyond the end of the actual trace it is extended with no-op instructions.
-func (p *AsteriscTraceProvider) loadProof(ctx context.Context, i uint64) (*utils.ProofData, error) {
+func (p *MTCannonTraceProvider) loadProof(ctx context.Context, i uint64) (*utils.ProofData, error) {
 	// Attempt to read the last step from disk cache
 	if p.lastStep == 0 {
 		step, err := utils.ReadLastStep(p.dir)
@@ -111,7 +113,7 @@ func (p *AsteriscTraceProvider) loadProof(ctx context.Context, i uint64) (*utils
 	file, err := ioutil.OpenDecompressed(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := p.generator.GenerateProof(ctx, p.dir, i); err != nil {
-			return nil, fmt.Errorf("generate asterisc trace with proof at %v: %w", i, err)
+			return nil, fmt.Errorf("generate cannon trace with proof at %v: %w", i, err)
 		}
 		// Try opening the file again now and it should exist.
 		file, err = ioutil.OpenDecompressed(path)
@@ -128,9 +130,10 @@ func (p *AsteriscTraceProvider) loadProof(ctx context.Context, i uint64) (*utils
 				p.lastStep = state.Step - 1
 				// Extend the trace out to the full length using a no-op instruction that doesn't change any state
 				// No execution is done, so no proof-data or oracle values are required.
+				witness, witnessHash := state.EncodeWitness()
 				proof := &utils.ProofData{
-					ClaimValue:   state.StateHash,
-					StateData:    state.Witness,
+					ClaimValue:   witnessHash,
+					StateData:    hexutil.Bytes(witness),
 					ProofData:    []byte{},
 					OracleKey:    nil,
 					OracleValue:  nil,
@@ -157,22 +160,19 @@ func (p *AsteriscTraceProvider) loadProof(ctx context.Context, i uint64) (*utils
 	return &proof, nil
 }
 
-func (c *AsteriscTraceProvider) finalState() (*VMState, error) {
-	state, err := parseState(filepath.Join(c.dir, vm.FinalState))
-	if err != nil {
-		return nil, fmt.Errorf("cannot read final state: %w", err)
-	}
-	return state, nil
+func (c *MTCannonTraceProvider) finalState() (*mipsevm.State, error) {
+	// TODO(client-pod#942): Implement this
+	return nil, errors.New("unimplemented")
 }
 
-// AsteriscTraceProviderForTest is a AsteriscTraceProvider that can find the step referencing the preimage read
+// MTCannonTraceProviderForTest is a MTCannonTraceProvider that can find the step referencing the preimage read
 // Only to be used for testing
-type AsteriscTraceProviderForTest struct {
-	*AsteriscTraceProvider
+type MTCannonTraceProviderForTest struct {
+	*MTCannonTraceProvider
 }
 
-func NewTraceProviderForTest(logger log.Logger, m vm.Metricer, absolutePrestate string, cfg vm.Config, localInputs utils.LocalGameInputs, dir string, gameDepth types.Depth) *AsteriscTraceProviderForTest {
-	p := &AsteriscTraceProvider{
+func NewTraceProviderForTest(logger log.Logger, m vm.Metricer, absolutePrestate string, cfg vm.Config, localInputs utils.LocalGameInputs, dir string, gameDepth types.Depth) *MTCannonTraceProviderForTest {
+	p := &MTCannonTraceProvider{
 		logger:         logger,
 		dir:            dir,
 		prestate:       absolutePrestate,
@@ -180,15 +180,15 @@ func NewTraceProviderForTest(logger log.Logger, m vm.Metricer, absolutePrestate 
 		gameDepth:      gameDepth,
 		preimageLoader: utils.NewPreimageLoader(kvstore.NewDiskKV(vm.PreimageDir(dir)).Get),
 	}
-	return &AsteriscTraceProviderForTest{p}
+	return &MTCannonTraceProviderForTest{p}
 }
 
-func (p *AsteriscTraceProviderForTest) FindStep(ctx context.Context, start uint64, preimage utils.PreimageOpt) (uint64, error) {
-	// Run asterisc to find the step that meets the preimage conditions
+func (p *MTCannonTraceProviderForTest) FindStep(ctx context.Context, start uint64, preimage utils.PreimageOpt) (uint64, error) {
+	// Run cannon to find the step that meets the preimage conditions
 	if err := p.generator.(*vm.Executor).DoGenerateProof(ctx, p.dir, start, math.MaxUint64, preimage()...); err != nil {
-		return 0, fmt.Errorf("generate asterisc trace (until preimage read): %w", err)
+		return 0, fmt.Errorf("generate cannon trace (until preimage read): %w", err)
 	}
-	// Load the step from the state asterisc finished with
+	// Load the step from the state cannon finished with
 	state, err := p.finalState()
 	if err != nil {
 		return 0, fmt.Errorf("failed to load final state: %w", err)

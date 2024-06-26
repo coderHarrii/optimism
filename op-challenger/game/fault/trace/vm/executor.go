@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/utils"
+	"github.com/ethereum-optimism/optimism/op-challenger/types"
 	"github.com/ethereum/go-ethereum/log"
 )
 
@@ -82,6 +83,11 @@ func (e *Executor) DoGenerateProof(ctx context.Context, dir string, begin uint64
 		"--snapshot-at", "%" + strconv.FormatUint(uint64(e.cfg.SnapshotFreq), 10),
 		"--snapshot-fmt", filepath.Join(snapshotDir, "%d.json.gz"),
 	}
+	if e.cfg.VmType == types.TraceTypeCannon.String() {
+		args = append(args, "--type", "cannon")
+	} else if e.cfg.VmType == types.TraceTypeCannon.String() {
+		args = append(args, "--type", "mt-cannon")
+	} // only cannon supports the `--type` option
 	if end < math.MaxUint64 {
 		args = append(args, "--stop-at", "="+strconv.FormatUint(end+1, 10))
 	}
